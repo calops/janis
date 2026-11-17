@@ -1,10 +1,11 @@
 import { Tokens, Typography, Metrics } from "../../tokens.slint";
 import { Strings } from "strings.slint";
+import { Chip } from "../../atoms/chip.slint";
 import { GhostButton } from "../../atoms/ghost_button.slint";
 import { PrimaryButton } from "../../atoms/primary_button.slint";
 import { YouTubeMusicIntegration } from "youtube_music_integration.slint";
 
-// Connects a saved-song library through a private cookie file, and shows sync status.
+// Imports a saved-song library from a browser or cookie file, and shows sync status.
 export component YouTubeMusicCard inherits Rectangle {
     border-radius: Metrics.radius-card;
     border-width: 1px;
@@ -45,16 +46,83 @@ export component YouTubeMusicCard inherits Rectangle {
             wrap: word-wrap;
         }
         Text {
+            text: Strings.youtube-music-account-browser-privacy;
+            font-size: Typography.caption;
+            color: Tokens.text-soft;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+        Text {
+            text: Strings.youtube-music-browser-label;
+            font-size: Typography.caption;
+            font-weight: Typography.semibold;
+            color: Tokens.text-soft;
+            horizontal-alignment: left;
+        }
+        FlexboxLayout {
+            spacing: 8px;
+            Chip {
+                label: Strings.youtube-music-browser-firefox;
+                active: YouTubeMusicIntegration.browser == "firefox";
+                clicked => {
+                    if !YouTubeMusicIntegration.busy {
+                        YouTubeMusicIntegration.browser-selected("firefox");
+                    }
+                }
+            }
+            Chip {
+                label: Strings.youtube-music-browser-chrome;
+                active: YouTubeMusicIntegration.browser == "chrome";
+                clicked => {
+                    if !YouTubeMusicIntegration.busy {
+                        YouTubeMusicIntegration.browser-selected("chrome");
+                    }
+                }
+            }
+            Chip {
+                label: Strings.youtube-music-browser-chromium;
+                active: YouTubeMusicIntegration.browser == "chromium";
+                clicked => {
+                    if !YouTubeMusicIntegration.busy {
+                        YouTubeMusicIntegration.browser-selected("chromium");
+                    }
+                }
+            }
+            Chip {
+                label: Strings.youtube-music-browser-brave;
+                active: YouTubeMusicIntegration.browser == "brave";
+                clicked => {
+                    if !YouTubeMusicIntegration.busy {
+                        YouTubeMusicIntegration.browser-selected("brave");
+                    }
+                }
+            }
+        }
+        Text {
+            text: Strings.youtube-music-account-manual-instructions;
+            font-size: Typography.caption;
+            color: Tokens.text-soft;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+        Text {
             text: Strings.youtube-music-account-warning;
             font-size: Typography.caption;
             color: Tokens.warning;
             horizontal-alignment: left;
             wrap: word-wrap;
         }
-        HorizontalLayout {
-            alignment: start;
+        FlexboxLayout {
             spacing: 12px;
             PrimaryButton {
+                label: Strings.youtube-music-import-browser;
+                clicked => {
+                    if !YouTubeMusicIntegration.busy {
+                        YouTubeMusicIntegration.browser-import-clicked();
+                    }
+                }
+            }
+            GhostButton {
                 label: Strings.youtube-music-connect;
                 clicked => {
                     if !YouTubeMusicIntegration.busy {
@@ -70,8 +138,8 @@ export component YouTubeMusicCard inherits Rectangle {
                     }
                 }
             }
-            if YouTubeMusicIntegration.configured: GhostButton {
-                label: Strings.youtube-music-disconnect;
+            if YouTubeMusicIntegration.configured || YouTubeMusicIntegration.busy: GhostButton {
+                label: YouTubeMusicIntegration.configured ? Strings.youtube-music-disconnect : Strings.youtube-music-cancel;
                 clicked => { YouTubeMusicIntegration.disconnect-clicked(); }
             }
         }

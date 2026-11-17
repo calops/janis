@@ -352,6 +352,9 @@ impl Application {
     /// Stops the engine and lets go of the controller. Called once the event
     /// loop has ended, while the process is still alive.
     pub fn shut_down(&self) {
+        self.youtube_music
+            .browser_activity
+            .shut_down(&self.youtube_music.sync_generation);
         self.frame_timer.stop();
         self.loudness.stop();
         self.track_overview.borrow().stop();
@@ -645,6 +648,9 @@ impl Application {
                     favourite,
                     sequence,
                 } => self.push_server_favourite(server, track_id, address, favourite, sequence),
+                Effect::ImportYouTubeMusicBrowser { browser, epoch } => {
+                    self.import_youtube_browser(browser, epoch);
+                }
                 Effect::SyncYouTubeMusicLibrary { cookie_file, epoch } => {
                     self.sync_youtube_library(cookie_file, epoch);
                 }

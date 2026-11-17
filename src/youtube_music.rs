@@ -100,6 +100,7 @@ pub enum Failure {
     Initialization,
     CookieFileUnreadable,
     InvalidCookieFile,
+    BrowserImport,
     CredentialsRejected,
     Network,
     Library,
@@ -124,6 +125,7 @@ impl Failure {
             Self::Initialization => "youtubeMusic.error.initialization",
             Self::CookieFileUnreadable => "youtubeMusic.error.cookieFile",
             Self::InvalidCookieFile => "youtubeMusic.error.invalidCookies",
+            Self::BrowserImport => "youtubeMusic.error.browserImport",
             Self::CredentialsRejected => "youtubeMusic.status.credentialsRejected",
             Self::Network => "youtubeMusic.error.network",
             Self::Library => "youtubeMusic.error.library",
@@ -146,6 +148,9 @@ impl fmt::Display for Failure {
             Self::Initialization => "the YouTube Music client could not be initialized",
             Self::CookieFileUnreadable => "the imported cookie file could not be read",
             Self::InvalidCookieFile => "the file does not contain valid YouTube cookies",
+            Self::BrowserImport => {
+                "browser cookies could not be imported; close the browser and retry"
+            }
             Self::CredentialsRejected => {
                 "the YouTube session was rejected; export fresh cookies and reconnect"
             }

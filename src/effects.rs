@@ -119,6 +119,10 @@ pub enum Effect {
     },
 
     // ── YouTube Music ────────────────────────────────────────────────────────
+    ImportYouTubeMusicBrowser {
+        browser: crate::youtube_browser_import::Browser,
+        epoch: u64,
+    },
     /// Read the complete saved library before importing it, then report back
     /// through `YouTubeMusicIntegration::sync_finished` with this `epoch`.
     SyncYouTubeMusicLibrary {

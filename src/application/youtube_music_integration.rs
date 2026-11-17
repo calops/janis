@@ -13,11 +13,32 @@ use super::{post, Application};
 use crate::library::{self, YouTubeMusicTrack};
 use crate::persistence;
 use crate::user_interface::YouTubeMusicIntegration;
+use crate::youtube_browser_import::{self, Browser};
 use crate::youtube_music::{Failure, Session};
+use tempfile::NamedTempFile;
 
 impl Application {
     pub(super) fn connect_youtube_integration(self: &Rc<Self>) {
         let view = self.window.global::<YouTubeMusicIntegration>();
+        view.on_browser_selected(
+            self.handler(|application, identifier: slint::SharedString| {
+                application
+                    .youtube_music
+                    .integration
+                    .borrow_mut()
+                    .select_browser(&identifier);
+                application.refresh_youtube_integration();
+            }),
+        );
+        view.on_browser_import_clicked(self.action(|application| {
+            let effects = application
+                .youtube_music
+                .integration
+                .borrow_mut()
+                .import_browser();
+            application.run(effects);
+            application.refresh_youtube_integration();
+        }));
         view.on_sync_clicked(self.action(|application| {
             let effects = application.youtube_music.integration.borrow_mut().sync();
             application.run(effects);
@@ -72,6 +93,54 @@ impl Application {
         });
     }
 
+    pub(super) fn import_youtube_browser(&self, browser: Browser, epoch: u64) {
+        self.youtube_music
+            .sync_generation
+            .store(epoch, Ordering::Release);
+        let generation = Arc::clone(&self.youtube_music.sync_generation);
+        let activity = Arc::clone(&self.youtube_music.browser_activity);
+        let runtime = Arc::clone(&self.youtube_music.runtime);
+        self.youtube_music.account_worker.run(move || {
+            let Some(_active) = activity.begin(&generation, epoch) else { return; };
+            let outcome = runtime.block_on(async {
+                tokio::select! {
+                    outcome = async {
+                        let directory = managed_cookie_directory()?;
+                        let cookies = youtube_browser_import::export(browser, &directory).await?;
+                        let songs = Session::from_cookie_file(cookies.path()).await?.saved_library().await?;
+                        Ok((cookies, songs))
+                    } => outcome,
+                    () = async {
+                        while generation.load(Ordering::Acquire) == epoch {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => Err(Failure::BrowserImport),
+                }
+            });
+            post(move |application| {
+                if !application.youtube_music.integration.borrow().is_current(epoch) {
+                    application.library_worker.run(move || drop(outcome));
+                    return;
+                }
+                match outcome {
+                    Ok((cookies, songs)) => {
+                        let path = cookies.path().to_path_buf();
+                        if application.youtube_music.integration.borrow_mut().browser_imported(epoch, path.clone()) {
+                            application.youtube_library_read(path, epoch, Ok(songs), Some(cookies));
+                        } else {
+                            application.library_worker.run(move || drop(cookies));
+                        }
+                    }
+                    Err(failure) => {
+                        let effects = application.youtube_music.integration.borrow_mut().sync_finished(epoch, Err(failure));
+                        application.run(effects);
+                    }
+                }
+                application.refresh_youtube_integration();
+            });
+        });
+    }
+
     pub(super) fn sync_youtube_library(&self, cookie_file: PathBuf, epoch: u64) {
         self.youtube_music
             .sync_generation
@@ -85,7 +154,7 @@ impl Application {
                     .await
             });
             post(move |application| {
-                application.youtube_library_read(cookie_file, epoch, outcome);
+                application.youtube_library_read(cookie_file, epoch, outcome, None);
             });
         });
     }
@@ -95,6 +164,7 @@ impl Application {
         cookie_file: PathBuf,
         epoch: u64,
         outcome: Result<Vec<YouTubeMusicTrack>, Failure>,
+        cookies: Option<NamedTempFile>,
     ) {
         if !self.youtube_music.integration.borrow().is_current(epoch) {
             return;
@@ -121,7 +191,31 @@ impl Application {
                 return;
             }
             let outcome = (|| {
-                library::sync_youtube_music_tracks(&database, &songs, &cookie_file)?;
+                let managed = if let Some(cookies) = cookies {
+                    let (file, path) = cookies
+                        .keep()
+                        .map_err(|_| "keep imported YouTube cookies".to_owned())?;
+                    drop(file);
+                    Some(path)
+                } else {
+                    None
+                };
+                let result = (|| {
+                    let previous = persistence::youtube_music_cookie_file(&database)?;
+                    library::sync_youtube_music_tracks(&database, &songs, &cookie_file)?;
+                    if previous.as_deref() != Some(cookie_file.as_path()) {
+                        if let Some(previous) = previous {
+                            remove_managed_cookie(&previous);
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    if let Some(path) = managed {
+                        remove_managed_cookie(&path);
+                    }
+                    return Err(error);
+                }
                 let count = library::count_youtube_music_tracks(&database)?;
                 let last_sync = persistence::youtube_music_last_sync(&database)?
                     .ok_or_else(|| "YouTube Music sync timestamp is missing".to_owned())?;
@@ -201,8 +295,14 @@ impl Application {
         }
         let database = Arc::clone(&self.database);
         self.library_worker.run(move || {
-            let outcome = library::remove_youtube_music_tracks(&database)
-                .and_then(|()| LibrarySnapshot::read(&database));
+            let outcome = (|| {
+                let previous = persistence::youtube_music_cookie_file(&database)?;
+                library::remove_youtube_music_tracks(&database)?;
+                if let Some(previous) = previous {
+                    remove_managed_cookie(&previous);
+                }
+                LibrarySnapshot::read(&database)
+            })();
             post(move |application| match outcome {
                 Ok(snapshot) => {
                     application.take_library(snapshot);
@@ -220,6 +320,7 @@ impl Application {
         let state = self.youtube_music.integration.borrow();
         let translations = self.translations.borrow();
         let view = self.window.global::<YouTubeMusicIntegration>();
+        view.set_browser(state.browser.identifier().into());
         view.set_connected(state.connected);
         view.set_configured(state.cookie_file.is_some());
         view.set_busy(state.busy);
@@ -237,5 +338,19 @@ impl Application {
                 .count("youtubeMusic.summary", state.song_count)
                 .into(),
         );
+    }
+}
+
+fn managed_cookie_directory() -> Result<PathBuf, Failure> {
+    crate::platform::data_directory()
+        .map(|directory| directory.join("youtube-cookies"))
+        .map_err(|_| Failure::BrowserImport)
+}
+
+fn remove_managed_cookie(path: &std::path::Path) {
+    if let Err(failure) = managed_cookie_directory()
+        .and_then(|directory| youtube_browser_import::remove_managed(path, &directory))
+    {
+        log::warn!("remove managed YouTube cookies: {failure}");
     }
 }

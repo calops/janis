@@ -4,9 +4,11 @@
 use std::path::PathBuf;
 
 use crate::effects::Effect;
+use crate::youtube_browser_import::Browser;
 use crate::youtube_music::Failure;
 
 pub struct YouTubeMusicIntegration {
+    pub browser: Browser,
     pub connected: bool,
     pub busy: bool,
     pub failed: bool,
@@ -19,13 +21,14 @@ pub struct YouTubeMusicIntegration {
 }
 
 struct PendingSync {
-    cookie_file: PathBuf,
+    cookie_file: Option<PathBuf>,
     replacing_connection: bool,
 }
 
 impl Default for YouTubeMusicIntegration {
     fn default() -> Self {
         Self {
+            browser: Browser::Firefox,
             connected: false,
             busy: false,
             failed: false,
@@ -69,6 +72,49 @@ impl YouTubeMusicIntegration {
         self.begin(cookie_file, true)
     }
 
+    pub fn select_browser(&mut self, identifier: &str) {
+        if !self.busy {
+            if let Some(browser) = Browser::from_identifier(identifier) {
+                self.browser = browser;
+            }
+        }
+    }
+
+    pub fn import_browser(&mut self) -> Vec<Effect> {
+        if self.busy {
+            return Vec::new();
+        }
+        self.epoch += 1;
+        self.busy = true;
+        self.failed = false;
+        self.status_key = "youtubeMusic.status.importingBrowser";
+        self.pending = Some(PendingSync {
+            cookie_file: None,
+            replacing_connection: true,
+        });
+        vec![Effect::ImportYouTubeMusicBrowser {
+            browser: self.browser,
+            epoch: self.epoch,
+        }]
+    }
+
+    /// The controller has exported and validated a private provider-only jar.
+    pub fn browser_imported(&mut self, epoch: u64, cookie_file: PathBuf) -> bool {
+        if !self.is_current(epoch) || !self.busy {
+            return false;
+        }
+        let Some(pending) = self
+            .pending
+            .as_mut()
+            .filter(|pending| pending.cookie_file.is_none())
+        else {
+            return false;
+        };
+        pending.cookie_file = Some(cookie_file);
+        self.status_key = "youtubeMusic.status.connecting";
+        true
+    }
+
     pub fn sync(&mut self) -> Vec<Effect> {
         if !self.connected || self.busy {
             return Vec::new();
@@ -94,7 +140,7 @@ impl YouTubeMusicIntegration {
             "youtubeMusic.status.syncing"
         };
         self.pending = Some(PendingSync {
-            cookie_file: cookie_file.clone(),
+            cookie_file: Some(cookie_file.clone()),
             replacing_connection,
         });
         vec![Effect::SyncYouTubeMusicLibrary {
@@ -136,10 +182,13 @@ impl YouTubeMusicIntegration {
         self.busy = false;
         match outcome {
             Ok((song_count, last_sync)) => {
+                let Some(cookie_file) = pending.cookie_file else {
+                    return self.failure(Failure::InvalidInput);
+                };
                 self.connected = true;
                 self.failed = false;
                 self.status_key = "youtubeMusic.status.connected";
-                self.cookie_file = Some(pending.cookie_file);
+                self.cookie_file = Some(cookie_file);
                 self.song_count = song_count;
                 self.last_sync = Some(last_sync);
                 Vec::new()
@@ -192,6 +241,60 @@ mod tests {
         let current = epoch(&state.connect(PathBuf::from("kept.txt")), "kept.txt");
         state.sync_finished(current, Ok((12, 100)));
         state
+    }
+
+    #[test]
+    fn browser_replacement_keeps_the_existing_connection_until_library_commit() {
+        let mut state = connected();
+        state.select_browser("chromium");
+        let current = match state.import_browser().as_slice() {
+            [Effect::ImportYouTubeMusicBrowser {
+                browser: Browser::Chromium,
+                epoch,
+            }] => *epoch,
+            _ => panic!("selected browser import"),
+        };
+        assert!(state.busy);
+        assert_eq!(state.cookie_file, Some(PathBuf::from("kept.txt")));
+        state.select_browser("brave");
+        assert_eq!(state.browser, Browser::Chromium);
+        assert!(state.import_browser().is_empty());
+        assert!(state.browser_imported(current, PathBuf::from("managed.txt")));
+        assert_eq!(state.cookie_file, Some(PathBuf::from("kept.txt")));
+        assert_eq!(state.song_count, 12);
+        state.sync_finished(current, Ok((24, 200)));
+        assert_eq!(state.cookie_file, Some(PathBuf::from("managed.txt")));
+        assert_eq!(state.song_count, 24);
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn a_failed_browser_export_keeps_the_saved_account_and_library() {
+        let mut state = connected();
+        let current = match state.import_browser().as_slice() {
+            [Effect::ImportYouTubeMusicBrowser { epoch, .. }] => *epoch,
+            _ => panic!("browser import"),
+        };
+        state.sync_finished(current, Err(Failure::BrowserImport));
+        assert!(state.connected && state.failed && !state.busy);
+        assert_eq!(state.cookie_file, Some(PathBuf::from("kept.txt")));
+        assert_eq!(state.song_count, 12);
+        assert_eq!(state.last_sync, Some(100));
+    }
+
+    #[test]
+    fn cancel_during_initial_browser_import_rejects_its_export_and_completion() {
+        let mut state = YouTubeMusicIntegration::default();
+        let current = match state.import_browser().as_slice() {
+            [Effect::ImportYouTubeMusicBrowser { epoch, .. }] => *epoch,
+            _ => panic!("browser import"),
+        };
+        assert_eq!(state.disconnect(), vec![Effect::RemoveYouTubeMusicLibrary]);
+        assert!(!state.browser_imported(current, PathBuf::from("discarded.txt")));
+        assert!(state.sync_finished(current, Ok((24, 200))).is_empty());
+        assert!(!state.connected && !state.busy);
+        assert_eq!(state.cookie_file, None);
+        assert_eq!(state.song_count, 0);
     }
 
     #[test]

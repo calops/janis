@@ -6,8 +6,11 @@ export global YouTubeMusicIntegration {
     in property <string> status;
     in property <bool> status-failed;
     in property <string> summary;
+    in-out property <string> browser: "firefox";
 
     callback connect-clicked();
+    callback browser-selected(string);
+    callback browser-import-clicked();
     callback sync-clicked();
     callback disconnect-clicked();
 }

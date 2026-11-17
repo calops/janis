@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -27,6 +27,7 @@ pub(super) struct YouTubeMusicController {
     pub(super) account_cookie_file: Arc<RwLock<Option<PathBuf>>>,
     pub(super) generation: Arc<AtomicU64>,
     pub(super) sync_generation: Arc<AtomicU64>,
+    pub(super) browser_activity: Arc<BrowserImportActivity>,
     pub(super) runtime: Arc<tokio::runtime::Runtime>,
     pub(super) account_worker: Worker,
     worker: Worker,
@@ -48,6 +49,7 @@ impl YouTubeMusicController {
             account_cookie_file: Arc::new(RwLock::new(cookie_file)),
             generation: Arc::new(AtomicU64::new(0)),
             sync_generation: Arc::new(AtomicU64::new(0)),
+            browser_activity: Arc::new(BrowserImportActivity::default()),
             runtime: Arc::new(runtime),
             account_worker: Worker::new("janis youtube account")?,
             worker: Worker::new("janis youtube browsing")?,
@@ -57,6 +59,59 @@ impl YouTubeMusicController {
 
     pub(super) fn session(&self) -> Session {
         self.session.clone()
+    }
+}
+
+/// Closing the app cancels and joins an active browser read before process exit,
+/// so its child and all-sites cookie workspace cannot outlive the controller.
+#[derive(Default)]
+pub(super) struct BrowserImportActivity {
+    active: Mutex<bool>,
+    finished: Condvar,
+}
+
+impl BrowserImportActivity {
+    pub(super) fn begin(
+        self: &Arc<Self>,
+        generation: &AtomicU64,
+        epoch: u64,
+    ) -> Option<BrowserImportGuard> {
+        let mut active = self
+            .active
+            .lock()
+            .expect("browser import activity lock poisoned");
+        if generation.load(Ordering::Acquire) != epoch {
+            return None;
+        }
+        *active = true;
+        Some(BrowserImportGuard(Arc::clone(self)))
+    }
+
+    pub(super) fn shut_down(&self, generation: &AtomicU64) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("browser import activity lock poisoned");
+        generation.fetch_add(1, Ordering::AcqRel);
+        while *active {
+            active = self
+                .finished
+                .wait(active)
+                .expect("browser import activity lock poisoned");
+        }
+    }
+}
+
+pub(super) struct BrowserImportGuard(Arc<BrowserImportActivity>);
+
+impl Drop for BrowserImportGuard {
+    fn drop(&mut self) {
+        *self
+            .0
+            .active
+            .lock()
+            .expect("browser import activity lock poisoned") = false;
+        self.0.finished.notify_all();
     }
 }
 
