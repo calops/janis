@@ -101,7 +101,7 @@ The canonical description of user-facing behavior. Every new feature lands here 
 - **Playback** toggles: normalization, gapless and crossfade are all live in the engine, on by default; exclusive output is still a persisted preference the engine does not act on yet. Toggling normalization is heard immediately, mid-track. Gapless and crossfade take effect from the next track boundary (crossfade turned off mid-fade stops it immediately instead of letting it finish).
 - **Audio output** cards: the output device the engine opened and its sample rate (both populate once something has played; "System default" / "—" until then).
 - **Jellyfin** card: the server's address and credentials, Sign in, Sync now, Sign out, and a switch per library of the server (see Jellyfin).
-- **YouTube Music** card: browser selection, Import from browser, manual cookie-file import, connection/sync status and library song count, Sync now and Disconnect (see YouTube Music). An initial import can be cancelled, and Disconnect remains available when saved credentials are rejected.
+- **YouTube Music** card: browser selection and a standalone Import from browser primary action. Manual cookie-file import, Sync now and Disconnect sit below it as secondary actions, followed by connection/sync status (see YouTube Music). The card shows the library song count; an initial import can be cancelled, and Disconnect remains available when saved credentials are rejected.
 - **Language** chips: English / Français. Persisted; `lang` attribute + localStorage FOUC mirror update immediately.
 - Open-source banner (GPL-3.0).
 
