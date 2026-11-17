@@ -233,8 +233,16 @@ impl Application {
         }
         let database = Arc::clone(&self.database);
         let session = self.media_session();
+        let youtube_session = self.youtube_music.session();
+        let youtube_runtime = Arc::clone(&self.youtube_music.runtime);
         self.picture_worker.run(move || {
-            let loaded = library_cover(&database, session.as_ref(), track_id, covers::HERO_SIDE);
+            let loaded = library_cover(
+                &database,
+                session.as_ref(),
+                (&youtube_session, &youtube_runtime),
+                track_id,
+                covers::HERO_SIDE,
+            );
             post(move |application| application.current_cover_loaded(epoch, loaded));
         });
     }
@@ -353,7 +361,13 @@ impl Application {
                         address.as_deref(),
                         covers::THUMBNAIL_SIDE,
                     ),
-                    None => keyed_cover(&database, session.as_ref(), &key, covers::THUMBNAIL_SIDE),
+                    None => keyed_cover(
+                        &database,
+                        session.as_ref(),
+                        (&youtube_session, &youtube_runtime),
+                        &key,
+                        covers::THUMBNAIL_SIDE,
+                    ),
                 };
                 post(move |application| application.thumbnail_loaded(epoch, key, loaded));
             });
@@ -407,12 +421,21 @@ impl Application {
 fn keyed_cover(
     database: &DbState,
     session: Option<&Session>,
+    youtube: (&crate::youtube_music::Session, &tokio::runtime::Runtime),
     key: &CoverKey,
     longest_side: u32,
 ) -> Result<Option<Pixels>, String> {
     match key {
-        CoverKey::Track(track_id) => library_cover(database, session, *track_id, longest_side),
+        CoverKey::Track(track_id) => {
+            library_cover(database, session, youtube, *track_id, longest_side)
+        }
         CoverKey::ServerPicture(item) => server_picture(session, item, longest_side),
+        CoverKey::Address(address) => super::youtube_music_screen::source_picture(
+            youtube.0,
+            youtube.1,
+            Some(address),
+            longest_side,
+        ),
     }
 }
 
@@ -422,6 +445,7 @@ fn keyed_cover(
 fn library_cover(
     database: &DbState,
     session: Option<&Session>,
+    youtube: (&crate::youtube_music::Session, &tokio::runtime::Runtime),
     track_id: i64,
     longest_side: u32,
 ) -> Result<Option<Pixels>, String> {
@@ -433,6 +457,12 @@ fn library_cover(
         CoverSource::Server {
             artwork_item: Some(item),
         } => server_picture(session, &item, longest_side),
+        CoverSource::Address { artwork_address } => super::youtube_music_screen::source_picture(
+            youtube.0,
+            youtube.1,
+            artwork_address.as_deref(),
+            longest_side,
+        ),
     }
 }
 

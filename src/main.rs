@@ -39,6 +39,7 @@ mod translations;
 mod visualizer;
 mod youtube_extraction;
 mod youtube_music;
+mod youtube_music_integration;
 mod youtube_music_state;
 
 /// The compiled user interface, and the function that fills its `Strings`

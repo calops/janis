@@ -1,34 +1,11 @@
-//! YouTube Music navigation, account transitions and stale-result rejection.
+//! Anonymous YouTube Music search and stale-result rejection.
 //! The controller performs every read; this module only decides and holds data.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::effects::{Effect, YouTubeMusicRequest};
-use crate::library::Track;
-use crate::youtube_music::{
-    Failure, Playlist, PlaylistContinuation, PlaylistPage, Song, SongContinuation, SongPage,
-};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum View {
-    #[default]
-    Search,
-    Saved,
-    Playlists,
-    Playlist,
-}
-
-impl View {
-    pub fn identifier(self) -> &'static str {
-        match self {
-            Self::Search => "search",
-            Self::Saved => "saved",
-            Self::Playlists => "playlists",
-            Self::Playlist => "playlist",
-        }
-    }
-}
+use crate::library::{Track, TrackSource};
+use crate::youtube_music::{Failure, Song, SongContinuation, SongPage};
 
 #[derive(Clone, Debug)]
 pub struct SongRow {
@@ -36,29 +13,15 @@ pub struct SongRow {
     pub track: Track,
 }
 
-#[derive(Clone, Debug)]
-pub struct PlaylistRow {
-    pub playlist: Playlist,
-    pub cover_id: i64,
-}
-
 pub struct YouTubeMusicState {
     pub query: String,
-    pub view: View,
-    pub connected: bool,
-    pub busy: bool,
     pub loading: bool,
     pub failed: bool,
     pub status_key: &'static str,
-    pub playlist_title: String,
     pub songs: Vec<SongRow>,
-    pub playlists: Vec<PlaylistRow>,
     pub next_songs: Option<SongContinuation>,
-    pub next_playlists: Option<PlaylistContinuation>,
     epoch: u64,
-    pending_cookie_file: Option<PathBuf>,
-    playlist_identifier: String,
-    registered: HashMap<String, SongRow>,
+    registered: HashMap<String, i64>,
     cover_urls: HashMap<i64, String>,
     next_identifier: i32,
 }
@@ -67,20 +30,12 @@ impl Default for YouTubeMusicState {
     fn default() -> Self {
         Self {
             query: String::new(),
-            view: View::Search,
-            connected: false,
-            busy: false,
             loading: false,
             failed: false,
-            status_key: "youtubeMusic.status.disconnected",
-            playlist_title: String::new(),
+            status_key: "",
             songs: Vec::new(),
-            playlists: Vec::new(),
             next_songs: None,
-            next_playlists: None,
             epoch: 0,
-            pending_cookie_file: None,
-            playlist_identifier: String::new(),
             registered: HashMap::new(),
             cover_urls: HashMap::new(),
             next_identifier: -2,
@@ -93,75 +48,13 @@ impl YouTubeMusicState {
         self.epoch == epoch
     }
 
-    pub fn connect(&mut self, cookie_file: PathBuf) -> Vec<Effect> {
-        self.epoch += 1;
-        self.busy = true;
-        self.loading = false;
-        self.failed = false;
-        self.status_key = "youtubeMusic.status.connecting";
-        self.pending_cookie_file = Some(cookie_file.clone());
-        vec![Effect::ConnectYouTubeMusic {
-            cookie_file,
-            epoch: self.epoch,
-        }]
-    }
-
-    pub fn connection_finished(&mut self, epoch: u64, outcome: Result<(), Failure>) -> Vec<Effect> {
-        if !self.is_current(epoch) {
-            return Vec::new();
-        }
-        self.busy = false;
-        match outcome {
-            Ok(()) => {
-                self.connected = true;
-                self.failed = false;
-                self.status_key = "youtubeMusic.status.connected";
-                let mut effects = vec![Effect::PersistYouTubeMusicCookieFile(
-                    self.pending_cookie_file.take(),
-                )];
-                effects.extend(self.select_view("saved"));
-                effects
-            }
-            Err(failure) => {
-                self.pending_cookie_file = None;
-                self.failure(failure)
-            }
-        }
-    }
-
-    pub fn disconnect(&mut self) -> Vec<Effect> {
-        self.epoch += 1;
-        self.connected = false;
-        self.busy = false;
-        self.loading = false;
-        self.failed = false;
-        self.status_key = "youtubeMusic.status.disconnected";
-        self.pending_cookie_file = None;
-        self.view = View::Search;
-        self.songs.clear();
-        self.playlists.clear();
-        self.next_songs = None;
-        self.next_playlists = None;
-        self.playlist_title.clear();
-        self.playlist_identifier.clear();
-        self.registered.clear();
-        self.cover_urls.clear();
-        // Never reuse transient ids: an old thumbnail may still be in the cache.
-        vec![
-            Effect::DisconnectYouTubeMusic,
-            Effect::PersistYouTubeMusicCookieFile(None),
-        ]
-    }
-
     pub fn search(&mut self, query: &str) -> Vec<Effect> {
-        if self.busy {
-            return Vec::new();
-        }
         self.query = query.trim().to_owned();
-        self.view = View::Search;
         if self.query.is_empty() {
             self.epoch += 1;
             self.loading = false;
+            self.failed = false;
+            self.status_key = "";
             self.songs.clear();
             self.next_songs = None;
             return Vec::new();
@@ -169,68 +62,15 @@ impl YouTubeMusicState {
         self.begin(YouTubeMusicRequest::Search(self.query.clone()), false)
     }
 
-    pub fn select_view(&mut self, identifier: &str) -> Vec<Effect> {
-        if self.busy {
-            return Vec::new();
-        }
-        let request = match identifier {
-            "search" => return self.search(&self.query.clone()),
-            "saved" => {
-                self.view = View::Saved;
-                YouTubeMusicRequest::SavedSongs
-            }
-            "playlists" => {
-                self.view = View::Playlists;
-                YouTubeMusicRequest::SavedPlaylists
-            }
-            _ => return Vec::new(),
-        };
-        if !self.connected {
-            self.epoch += 1;
-            self.loading = false;
-            self.songs.clear();
-            self.playlists.clear();
-            self.status_key = "youtubeMusic.status.disconnected";
-            return Vec::new();
-        }
-        self.begin(request, false)
-    }
-
-    pub fn open_playlist(&mut self, index: usize) -> Vec<Effect> {
-        if self.busy || !self.connected {
-            return Vec::new();
-        }
-        let Some(row) = self.playlists.get(index) else {
-            return Vec::new();
-        };
-        self.playlist_title = row.playlist.title.clone();
-        self.playlist_identifier = row.playlist.identifier.clone();
-        self.view = View::Playlist;
-        self.begin(
-            YouTubeMusicRequest::Playlist(self.playlist_identifier.clone()),
-            false,
-        )
-    }
-
     pub fn more(&mut self) -> Vec<Effect> {
-        if self.busy || self.loading {
+        if self.loading || self.next_songs.is_none() {
             return Vec::new();
         }
-        if self.view == View::Playlists && self.next_playlists.is_some() {
-            self.begin(YouTubeMusicRequest::MorePlaylists, true)
-        } else if self.view != View::Playlists && self.next_songs.is_some() {
-            self.begin(YouTubeMusicRequest::MoreSongs, true)
-        } else {
-            Vec::new()
-        }
+        self.begin(YouTubeMusicRequest::MoreSongs, true)
     }
 
     pub fn has_more(&self) -> bool {
-        if self.view == View::Playlists {
-            self.next_playlists.is_some()
-        } else {
-            self.next_songs.is_some()
-        }
+        self.next_songs.is_some()
     }
 
     fn begin(&mut self, request: YouTubeMusicRequest, append: bool) -> Vec<Effect> {
@@ -240,12 +80,7 @@ impl YouTubeMusicState {
         self.status_key = "youtubeMusic.status.loading";
         if !append {
             self.next_songs = None;
-            self.next_playlists = None;
-            if self.view == View::Playlists {
-                self.playlists.clear();
-            } else {
-                self.songs.clear();
-            }
+            self.songs.clear();
         }
         vec![Effect::ReadYouTubeMusic {
             request,
@@ -259,7 +94,7 @@ impl YouTubeMusicState {
         outcome: Result<SongPage, Failure>,
         append: bool,
     ) -> Vec<Effect> {
-        if !self.is_current(epoch) {
+        if !self.is_current(epoch) || !self.loading {
             return Vec::new();
         }
         self.loading = false;
@@ -279,88 +114,26 @@ impl YouTubeMusicState {
                     }
                 }
                 self.next_songs = page.next;
-                self.succeeded();
+                self.failed = false;
+                self.status_key = "";
                 Vec::new()
             }
-            Err(failure) => self.failure(failure),
-        }
-    }
-
-    pub fn playlists_finished(
-        &mut self,
-        epoch: u64,
-        outcome: Result<PlaylistPage, Failure>,
-        append: bool,
-    ) -> Vec<Effect> {
-        if !self.is_current(epoch) {
-            return Vec::new();
-        }
-        self.loading = false;
-        match outcome {
-            Ok(page) => {
-                if !append {
-                    self.playlists.clear();
-                }
-                for playlist in page.playlists {
-                    if self
-                        .playlists
-                        .iter()
-                        .any(|shown| shown.playlist.identifier == playlist.identifier)
-                    {
-                        continue;
-                    }
-                    let cover_id = self.allocate_identifier();
-                    if let Some(url) = &playlist.artwork_url {
-                        self.cover_urls.insert(cover_id, url.clone());
-                    }
-                    self.playlists.push(PlaylistRow { playlist, cover_id });
-                }
-                self.next_playlists = page.next;
-                self.succeeded();
-                Vec::new()
+            Err(failure) => {
+                self.failed = true;
+                self.status_key = "youtubeMusic.status.failed";
+                vec![Effect::NotifyError {
+                    key: failure.translation_key(),
+                    parameters: Vec::new(),
+                    dedupe_key: Some("youtube-music-search"),
+                }]
             }
-            Err(failure) => self.failure(failure),
         }
-    }
-
-    fn succeeded(&mut self) {
-        self.failed = false;
-        self.status_key = if self.connected {
-            "youtubeMusic.status.connected"
-        } else {
-            "youtubeMusic.status.disconnected"
-        };
-    }
-
-    fn failure(&mut self, failure: Failure) -> Vec<Effect> {
-        self.failed = true;
-        let rejected = failure.credentials_rejected();
-        self.status_key = if rejected {
-            "youtubeMusic.status.credentialsRejected"
-        } else {
-            "youtubeMusic.status.failed"
-        };
-        let mut effects = Vec::new();
-        if rejected {
-            self.connected = false;
-            self.songs.clear();
-            self.playlists.clear();
-            self.next_songs = None;
-            self.next_playlists = None;
-            effects.push(Effect::DisconnectYouTubeMusic);
-        }
-        effects.push(Effect::NotifyError {
-            key: failure.translation_key(),
-            parameters: Vec::new(),
-            dedupe_key: Some("youtube-music"),
-        });
-        effects
     }
 
     fn allocate_identifier(&mut self) -> i64 {
+        // Negative ids belong only to transient source rows, not SQLite tracks.
         let identifier = self.next_identifier;
-        self.next_identifier = self
-            .next_identifier
+        self.next_identifier = identifier
             .checked_sub(1)
             .expect("transient track identifiers fit the interface");
         i64::from(identifier)
@@ -370,39 +143,34 @@ impl YouTubeMusicState {
         let identifier = self
             .registered
             .get(&song.identifier)
-            .map(|row| row.track.id)
+            .copied()
             .unwrap_or_else(|| self.allocate_identifier());
-        if let Some(url) = &song.artwork_url {
-            self.cover_urls.insert(identifier, url.clone());
+        self.registered.insert(song.identifier.clone(), identifier);
+        if let Some(address) = &song.artwork_url {
+            self.cover_urls.insert(identifier, address.clone());
+        } else {
+            self.cover_urls.remove(&identifier);
         }
-        let row = SongRow {
+        SongRow {
             track: song_track(&song, identifier),
             song,
-        };
-        self.registered
-            .insert(row.song.identifier.clone(), row.clone());
-        row
+        }
     }
 
     pub fn cover_url(&self, track_id: i64) -> Option<&str> {
         self.cover_urls.get(&track_id).map(String::as_str)
     }
+
     pub fn queue(&self) -> Vec<Track> {
         self.songs.iter().map(|row| row.track.clone()).collect()
     }
+
     pub fn visible_track_id(&self, index: usize) -> Option<i64> {
-        if self.view == View::Playlists {
-            self.playlists.get(index).map(|row| row.cover_id)
-        } else {
-            self.songs.get(index).map(|row| row.track.id)
-        }
+        self.songs.get(index).map(|row| row.track.id)
     }
+
     pub fn visible_length(&self) -> usize {
-        if self.view == View::Playlists {
-            self.playlists.len()
-        } else {
-            self.songs.len()
-        }
+        self.songs.len()
     }
 }
 
@@ -410,9 +178,11 @@ impl YouTubeMusicState {
 pub fn song_track(song: &Song, identifier: i64) -> Track {
     Track {
         id: identifier,
+        source: TrackSource::YouTubeMusic,
         folder_id: None,
         server_id: None,
         artwork_item: None,
+        artwork_address: song.artwork_url.clone(),
         server_libraries: Vec::new(),
         path: format!("youtube-music://{}", song.identifier),
         title: song.title.clone(),
@@ -420,7 +190,7 @@ pub fn song_track(song: &Song, identifier: i64) -> Track {
         album: song.album.clone(),
         composer: None,
         duration_secs: f64::from(song.duration_seconds),
-        format: "AAC".into(),
+        format: String::new(),
         sample_rate: None,
         bit_depth: None,
         channels: None,
@@ -438,12 +208,15 @@ pub fn song_track(song: &Song, identifier: i64) -> Track {
 }
 
 pub fn video_identifier(track: &Track) -> Option<&str> {
-    track.path.strip_prefix("youtube-music://")
+    (track.source == TrackSource::YouTubeMusic)
+        .then(|| track.path.strip_prefix("youtube-music://"))
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn song(identifier: &str) -> Song {
         Song {
             identifier: identifier.into(),
@@ -451,109 +224,108 @@ mod tests {
             artist: "Artist".into(),
             album: None,
             duration_seconds: 100,
-            artwork_url: None,
+            artwork_url: Some("https://i.ytimg.com/song.jpg".into()),
         }
     }
+
     fn epoch(effects: &[Effect]) -> u64 {
         match &effects[0] {
             Effect::ReadYouTubeMusic { epoch, .. } => *epoch,
-            _ => panic!("a read effect"),
+            _ => panic!("a search emits a read effect"),
         }
     }
+
+    fn page(identifiers: &[&str]) -> SongPage {
+        SongPage {
+            songs: identifiers
+                .iter()
+                .map(|identifier| song(identifier))
+                .collect(),
+            next: None,
+        }
+    }
+
     #[test]
-    fn an_old_search_cannot_replace_a_new_query_or_a_disconnected_account() {
+    fn an_old_search_cannot_replace_a_new_query() {
         let mut state = YouTubeMusicState::default();
         let old = epoch(&state.search("old"));
         let current = epoch(&state.search("new"));
-        state.songs_finished(
-            old,
-            Ok(SongPage {
-                songs: vec![song("old")],
-                next: None,
-            }),
-            false,
-        );
+        assert!(state
+            .songs_finished(old, Ok(page(&["old"])), false)
+            .is_empty());
         assert!(state.songs.is_empty());
-        state.songs_finished(
-            current,
-            Ok(SongPage {
-                songs: vec![song("new")],
-                next: None,
-            }),
-            false,
-        );
+        assert!(state.loading);
+        state.songs_finished(current, Ok(page(&["new"])), false);
         assert_eq!(state.songs[0].song.identifier, "new");
-        state.disconnect();
-        state.songs_finished(
-            current,
-            Ok(SongPage {
-                songs: vec![song("new")],
-                next: None,
-            }),
-            false,
-        );
-        assert!(state.songs.is_empty());
-        assert!(!state.connected);
-    }
-    #[test]
-    fn account_views_do_not_fetch_without_a_connection() {
-        let mut state = YouTubeMusicState::default();
-        assert!(state.select_view("saved").is_empty());
-        assert!(state.select_view("playlists").is_empty());
-        assert_eq!(state.view, View::Playlists);
         assert!(!state.loading);
+        assert_eq!(state.status_key, "");
     }
+
     #[test]
-    fn duplicate_page_songs_keep_one_stable_identity_and_disconnect_never_reuses_it() {
+    fn duplicate_page_songs_keep_one_stable_negative_identity() {
         let mut state = YouTubeMusicState::default();
         let request = epoch(&state.search("song"));
-        state.songs_finished(
-            request,
-            Ok(SongPage {
-                songs: vec![song("one"), song("one")],
-                next: None,
-            }),
-            false,
-        );
+        state.songs_finished(request, Ok(page(&["one", "one"])), false);
         let identifier = state.songs[0].track.id;
+        assert_eq!(identifier, -2);
         assert_eq!(state.songs.len(), 1);
         let request = epoch(&state.search("again"));
-        state.songs_finished(
-            request,
-            Ok(SongPage {
-                songs: vec![song("one")],
-                next: None,
-            }),
-            false,
-        );
+        state.songs_finished(request, Ok(page(&["one", "two"])), false);
         assert_eq!(state.songs[0].track.id, identifier);
-        state.disconnect();
-        let request = epoch(&state.search("again"));
-        state.songs_finished(
-            request,
-            Ok(SongPage {
-                songs: vec![song("one")],
-                next: None,
-            }),
-            false,
-        );
-        assert!(state.songs[0].track.id < identifier);
+        assert!(state.songs[1].track.id < identifier);
         assert_eq!(state.songs[0].track.path, "youtube-music://one");
+        assert_eq!(state.songs[0].track.source, TrackSource::YouTubeMusic);
+        assert_eq!(
+            state.cover_url(identifier),
+            state.songs[0].track.artwork_address.as_deref()
+        );
+        assert_eq!(state.queue().len(), 2);
+        assert_eq!(state.visible_track_id(1), Some(state.songs[1].track.id));
+        assert_eq!(state.visible_length(), 2);
     }
+
     #[test]
     fn clearing_a_query_invalidates_its_pending_read() {
         let mut state = YouTubeMusicState::default();
         let old = epoch(&state.search("pending"));
-        state.search("  ");
-        state.songs_finished(
-            old,
-            Ok(SongPage {
-                songs: vec![song("one")],
-                next: None,
-            }),
-            false,
-        );
+        assert!(state.search("  ").is_empty());
+        state.songs_finished(old, Ok(page(&["one"])), false);
         assert!(state.songs.is_empty());
         assert_eq!(state.query, "");
+        assert!(!state.loading);
+        assert!(!state.failed);
+        assert!(!state.has_more());
+        assert!(state.more().is_empty());
+    }
+
+    #[test]
+    fn a_failed_page_keeps_shown_songs_and_notifies_without_account_effects() {
+        let mut state = YouTubeMusicState::default();
+        let request = epoch(&state.search("song"));
+        state.songs_finished(request, Ok(page(&["one"])), false);
+        let request = epoch(&state.begin(YouTubeMusicRequest::MoreSongs, true));
+        assert_eq!(
+            state.songs_finished(request, Err(Failure::Network), true),
+            vec![Effect::NotifyError {
+                key: "youtubeMusic.error.network",
+                parameters: Vec::new(),
+                dedupe_key: Some("youtube-music-search"),
+            }]
+        );
+        assert_eq!(state.songs[0].song.identifier, "one");
+        assert!(state.failed);
+        assert!(!state.loading);
+        assert!(state
+            .songs_finished(request, Ok(page(&["late"])), true)
+            .is_empty());
+        assert_eq!(state.songs.len(), 1);
+    }
+
+    #[test]
+    fn only_youtube_music_tracks_expose_a_video_identifier() {
+        let mut track = song_track(&song("dQw4w9WgXcQ"), -2);
+        assert_eq!(video_identifier(&track), Some("dQw4w9WgXcQ"));
+        track.source = TrackSource::File;
+        assert_eq!(video_identifier(&track), None);
     }
 }

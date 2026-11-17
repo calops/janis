@@ -1,20 +1,21 @@
 //! YouTube Music catalog and account access, with playback extraction delegated separately.
 //!
-//! Calls belong on a worker. The caller owns the imported file; this session keeps
-//! its path for extraction and holds catalog authentication cookies only in memory.
+//! Calls belong on a worker. Imported authentication cookies stay in session
+//! memory; playback extraction is a separate service with caller-owned credentials.
 
 use std::fmt;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use rustypipe::client::{RustyPipe, RustyPipeQuery};
 use rustypipe::error::{Error, ExtractionError};
 use rustypipe::model::paginator::{ContinuationEndpoint, Paginator};
-use rustypipe::model::{MusicPlaylistItem, Thumbnail, TrackItem, TrackType};
+use rustypipe::model::{Thumbnail, TrackItem, TrackType};
 
-use crate::audio::Location;
+use crate::audio::{Location, Metadata};
+use crate::library::YouTubeMusicTrack;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const LARGEST_COOKIE_FILE_BYTES: u64 = 1024 * 1024;
@@ -31,24 +32,10 @@ pub struct Song {
     pub artwork_url: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Playlist {
-    pub identifier: String,
-    pub title: String,
-    pub description: String,
-    pub artwork_url: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 pub struct SongPage {
     pub songs: Vec<Song>,
     pub next: Option<SongContinuation>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PlaylistPage {
-    pub playlists: Vec<Playlist>,
-    pub next: Option<PlaylistContinuation>,
 }
 
 /// Tokens are endpoint-specific and may only be used by their originating session.
@@ -70,15 +57,11 @@ impl fmt::Debug for Continuation {
 #[derive(Clone, Debug)]
 pub struct SongContinuation(Continuation);
 
-#[derive(Clone, Debug)]
-pub struct PlaylistContinuation(Continuation);
-
 #[derive(Clone)]
 pub struct Session {
     client: RustyPipe,
     artwork_client: reqwest::Client,
     authenticated: bool,
-    cookie_file: Option<PathBuf>,
     identity: Arc<()>,
 }
 
@@ -119,6 +102,7 @@ pub enum Failure {
     InvalidCookieFile,
     CredentialsRejected,
     Network,
+    Library,
     Unavailable,
     UnsupportedAudio,
     ExtractorUnavailable,
@@ -142,6 +126,7 @@ impl Failure {
             Self::InvalidCookieFile => "youtubeMusic.error.invalidCookies",
             Self::CredentialsRejected => "youtubeMusic.status.credentialsRejected",
             Self::Network => "youtubeMusic.error.network",
+            Self::Library => "youtubeMusic.error.library",
             Self::Unavailable => "youtubeMusic.error.unavailable",
             Self::UnsupportedAudio => "youtubeMusic.error.unsupportedAudio",
             Self::ExtractorUnavailable => "youtubeMusic.error.extractorUnavailable",
@@ -165,6 +150,7 @@ impl fmt::Display for Failure {
                 "the YouTube session was rejected; export fresh cookies and reconnect"
             }
             Self::Network => "YouTube Music could not be reached; try again later",
+            Self::Library => "the YouTube Music library could not be updated",
             Self::Unavailable => "this content is unavailable for this session or region",
             Self::UnsupportedAudio => "this track has no supported unencrypted AAC/M4A audio",
             Self::ExtractorUnavailable => {
@@ -210,13 +196,12 @@ impl Session {
             client,
             artwork_client,
             authenticated: false,
-            cookie_file: None,
             identity: Arc::new(()),
         })
     }
 
     /// Reads the file only on the worker that performs the account connection.
-    /// An accepted cookie must also be able to read the music account library.
+    /// The first `saved_library` read validates access before any import is kept.
     pub async fn from_cookie_file(path: &Path) -> Result<Self, Failure> {
         let cookies = read_cookie_file(path)?;
         let mut session = Self::anonymous()?;
@@ -226,15 +211,7 @@ impl Session {
             .await
             .map_err(upstream_failure)?;
         drop(cookies);
-        session
-            .client
-            .query()
-            .authenticated()
-            .music_saved_tracks()
-            .await
-            .map_err(upstream_failure)?;
         session.authenticated = true;
-        session.cookie_file = Some(path.to_path_buf());
         Ok(session)
     }
 
@@ -254,73 +231,46 @@ impl Session {
         Ok(self.song_page(result.items))
     }
 
-    pub async fn saved_songs(&self) -> Result<SongPage, Failure> {
+    /// A complete authoritative listing: no partial result escapes a failed page.
+    pub async fn saved_library(&self) -> Result<Vec<YouTubeMusicTrack>, Failure> {
+        let mut page = self.saved_songs().await?;
+        let mut tracks = Vec::new();
+        loop {
+            let next = self.continuation(&mut page).map(SongContinuation);
+            tracks.extend(page.items.into_iter().filter_map(library_track));
+            let Some(next) = next else {
+                return Ok(tracks);
+            };
+            page = self.continued_songs(next).await?;
+        }
+    }
+
+    async fn saved_songs(&self) -> Result<Paginator<TrackItem>, Failure> {
         self.require_account()?;
-        let page = self
-            .query(true)
+        self.query(true)
             .music_saved_tracks()
             .await
-            .map_err(upstream_failure)?;
-        Ok(self.song_page(page))
-    }
-
-    pub async fn saved_playlists(&self) -> Result<PlaylistPage, Failure> {
-        self.require_account()?;
-        let page = self
-            .query(true)
-            .music_saved_playlists()
-            .await
-            .map_err(upstream_failure)?;
-        Ok(self.playlist_page(page))
-    }
-
-    pub async fn playlist(&self, identifier: &str) -> Result<SongPage, Failure> {
-        if !is_playlist_identifier(identifier) {
-            return Err(Failure::InvalidInput);
-        }
-        let playlist = self
-            .query(self.authenticated)
-            .music_playlist(identifier)
-            .await
-            .map_err(upstream_failure)?;
-        Ok(self.song_page(playlist.tracks))
+            .map_err(upstream_failure)
     }
 
     pub async fn more_songs(&self, continuation: SongContinuation) -> Result<SongPage, Failure> {
+        Ok(self.song_page(self.continued_songs(continuation).await?))
+    }
+
+    async fn continued_songs(
+        &self,
+        continuation: SongContinuation,
+    ) -> Result<Paginator<TrackItem>, Failure> {
         let continuation = continuation.0;
         self.check_continuation(&continuation)?;
-        let page = self
-            .query(continuation.authenticated)
+        self.query(continuation.authenticated)
             .continuation::<TrackItem, _>(
                 continuation.token,
                 continuation.endpoint,
                 continuation.visitor_data.as_deref(),
             )
             .await
-            .map_err(upstream_failure)?;
-        Ok(self.song_page(page))
-    }
-
-    pub async fn more_playlists(
-        &self,
-        continuation: PlaylistContinuation,
-    ) -> Result<PlaylistPage, Failure> {
-        let continuation = continuation.0;
-        self.check_continuation(&continuation)?;
-        let page = self
-            .query(continuation.authenticated)
-            .continuation::<MusicPlaylistItem, _>(
-                continuation.token,
-                continuation.endpoint,
-                continuation.visitor_data.as_deref(),
-            )
-            .await
-            .map_err(upstream_failure)?;
-        Ok(self.playlist_page(page))
-    }
-
-    pub async fn resolve(&self, identifier: &str) -> Result<ResolvedAudio, Failure> {
-        crate::youtube_extraction::resolve(identifier, self.cookie_file.as_deref()).await
+            .map_err(upstream_failure)
     }
 
     /// Downloads encoded bytes; the existing cover decoder applies pixel limits.
@@ -398,14 +348,6 @@ impl Session {
             next,
         }
     }
-
-    fn playlist_page(&self, mut page: Paginator<MusicPlaylistItem>) -> PlaylistPage {
-        let next = self.continuation(&mut page).map(PlaylistContinuation);
-        PlaylistPage {
-            playlists: page.items.into_iter().filter_map(playlist).collect(),
-            next,
-        }
-    }
 }
 
 fn read_cookie_file(path: &Path) -> Result<String, Failure> {
@@ -449,10 +391,6 @@ fn is_song_identifier(identifier: &str) -> bool {
     identifier.len() == 11 && is_identifier(identifier)
 }
 
-fn is_playlist_identifier(identifier: &str) -> bool {
-    !identifier.is_empty() && identifier.len() <= 256 && is_identifier(identifier)
-}
-
 fn is_identifier(identifier: &str) -> bool {
     identifier
         .bytes()
@@ -491,22 +429,53 @@ fn song(track: TrackItem) -> Option<Song> {
     })
 }
 
-fn playlist(playlist: MusicPlaylistItem) -> Option<Playlist> {
-    if !is_playlist_identifier(&playlist.id)
-        || playlist.name.trim().is_empty()
-        || playlist.is_podcast
+fn library_track(track: TrackItem) -> Option<YouTubeMusicTrack> {
+    if !is_song_identifier(&track.id)
+        || track.name.trim().is_empty()
+        || track.track_type == TrackType::Episode
+        || track.unavailable
     {
         return None;
     }
-    Some(Playlist {
-        identifier: playlist.id,
-        title: playlist.name,
-        // The account-list endpoint supplies the creator, not a full description.
-        description: playlist
-            .channel
-            .map(|channel| channel.name)
-            .unwrap_or_default(),
-        artwork_url: thumbnail(playlist.thumbnail),
+    let artist = track
+        .artists
+        .into_iter()
+        .map(|artist| artist.name)
+        .filter(|artist| !artist.trim().is_empty())
+        .reduce(|mut combined, artist| {
+            combined.push_str(", ");
+            combined.push_str(&artist);
+            combined
+        });
+    Some(YouTubeMusicTrack {
+        identifier: track.id,
+        metadata: Metadata {
+            title: track.name,
+            artist,
+            album: track
+                .album
+                .map(|album| album.name)
+                .filter(|name| !name.trim().is_empty()),
+            composer: None,
+            duration_secs: f64::from(track.duration.unwrap_or_default()),
+            format: String::new(),
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            lossless: false,
+            track_number: track.track_nr.map(u32::from),
+            track_total: None,
+            disc_number: None,
+            disc_total: None,
+            year: None,
+            genre: None,
+            album_artist: None,
+            rg_track_gain_db: None,
+            rg_track_peak: None,
+            rg_album_gain_db: None,
+            rg_album_peak: None,
+        },
+        artwork_address: thumbnail(track.cover),
     })
 }
 
@@ -655,32 +624,15 @@ mod tests {
     }
 
     #[test]
-    fn account_playlist_mapping_preserves_creator_cover_and_authenticated_continuation() {
-        let session = Session::anonymous().expect("an in-memory client can be created");
-        let item: MusicPlaylistItem = serde_json::from_value(serde_json::json!({
-            "id": "PLsaved_music",
-            "name": "Saved music",
-            "thumbnail": [{"url": "https://i.ytimg.com/playlist.jpg", "width": 300, "height": 300}],
-            "channel": {"id": "creator", "name": "The creator"},
-            "track_count": 125,
-            "from_ytm": true,
-            "is_podcast": false
-        }))
-        .expect("the sample is a complete RustyPipe music playlist");
+    fn account_song_continuations_require_the_originating_authenticated_session() {
+        let mut session = Session::anonymous().expect("an in-memory client can be created");
         let mut page = Paginator::default();
-        page.items.push(item.clone());
+        page.items.push(track());
         page.ctoken = Some("account-continuation".into());
         page.visitor_data = Some("account-visitor".into());
         page.endpoint = ContinuationEndpoint::MusicBrowse;
         page.authenticated = true;
-        let page = session.playlist_page(page);
-        assert_eq!(page.playlists[0].identifier, "PLsaved_music");
-        assert_eq!(page.playlists[0].title, "Saved music");
-        assert_eq!(page.playlists[0].description, "The creator");
-        assert_eq!(
-            page.playlists[0].artwork_url.as_deref(),
-            Some("https://i.ytimg.com/playlist.jpg")
-        );
+        let page = session.song_page(page);
         let continuation = page.next.expect("the account page continues").0;
         assert_eq!(continuation.endpoint, ContinuationEndpoint::MusicBrowse);
         assert_eq!(
@@ -692,9 +644,72 @@ mod tests {
             session.check_continuation(&continuation),
             Err(Failure::CredentialsRejected)
         );
-        let mut podcast = item;
-        podcast.is_podcast = true;
-        assert!(playlist(podcast).is_none());
+        session.authenticated = true;
+        assert!(session.check_continuation(&continuation).is_ok());
+        let mut other_session = Session::anonymous().expect("an independent client can be created");
+        other_session.authenticated = true;
+        assert_eq!(
+            other_session.check_continuation(&continuation),
+            Err(Failure::InvalidContinuation)
+        );
+    }
+
+    #[test]
+    fn saved_library_mapping_preserves_available_metadata_without_inventing_audio_properties() {
+        let mut item = track();
+        item.track_nr = Some(7);
+        let mapped = library_track(item).expect("the fixture is a saved song");
+        assert_eq!(mapped.identifier, "dQw4w9WgXcQ");
+        assert_eq!(mapped.metadata.title, "A song");
+        assert_eq!(
+            mapped.metadata.artist.as_deref(),
+            Some("First artist, Second artist")
+        );
+        assert_eq!(mapped.metadata.album.as_deref(), Some("The album"));
+        assert_eq!(mapped.metadata.duration_secs, 213.0);
+        assert_eq!(mapped.metadata.track_number, Some(7));
+        assert_eq!(
+            mapped.artwork_address.as_deref(),
+            Some("https://lh3.googleusercontent.com/large")
+        );
+        assert!(mapped.metadata.format.is_empty());
+        assert_eq!(mapped.metadata.sample_rate, None);
+        assert_eq!(mapped.metadata.bit_depth, None);
+        assert_eq!(mapped.metadata.channels, None);
+        assert_eq!(mapped.metadata.year, None);
+        assert_eq!(mapped.metadata.rg_track_gain_db, None);
+    }
+
+    #[test]
+    fn saved_library_mapping_keeps_songs_with_unknown_optional_metadata() {
+        let mut item = track();
+        item.artists.clear();
+        item.album = None;
+        item.duration = None;
+        item.cover.clear();
+        let mapped =
+            library_track(item).expect("missing optional tags do not discard a saved song");
+        assert_eq!(mapped.metadata.artist, None);
+        assert_eq!(mapped.metadata.album, None);
+        assert_eq!(mapped.metadata.duration_secs, 0.0);
+        assert_eq!(mapped.metadata.track_number, None);
+        assert_eq!(mapped.artwork_address, None);
+    }
+
+    #[test]
+    fn saved_library_mapping_excludes_unavailable_podcast_and_invalid_rows() {
+        let mut item = track();
+        item.unavailable = true;
+        assert!(library_track(item).is_none());
+        let mut item = track();
+        item.track_type = TrackType::Episode;
+        assert!(library_track(item).is_none());
+        let mut item = track();
+        item.id.clear();
+        assert!(library_track(item).is_none());
+        let mut item = track();
+        item.name.clear();
+        assert!(library_track(item).is_none());
     }
 
     #[test]
@@ -713,17 +728,6 @@ mod tests {
         }
         assert!(upstream_failure(Error::HttpStatus(401, secret.into())).credentials_rejected());
         assert!(!upstream_failure(Error::Http(secret.into())).credentials_rejected());
-    }
-
-    #[test]
-    fn session_diagnostics_do_not_reveal_the_imported_cookie_path() {
-        let mut session = Session::anonymous().expect("an in-memory client can be created");
-        session.authenticated = true;
-        session.cookie_file = Some(PathBuf::from("/private/secret-cookie-export.txt"));
-        let diagnostic = format!("{session:?}");
-        assert!(diagnostic.contains("authenticated: true"));
-        assert!(!diagnostic.contains("private"));
-        assert!(!diagnostic.contains("secret-cookie-export"));
     }
 
     #[test]

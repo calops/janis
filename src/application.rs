@@ -16,6 +16,7 @@ mod now_playing_screen;
 mod radio_screen;
 mod settings_screen;
 mod track_overview;
+mod youtube_music_integration;
 mod youtube_music_screen;
 
 use artwork::{CurrentArt, Thumbnail};
@@ -201,6 +202,11 @@ impl Application {
         let kept_server = persistence::media_server(&database)?;
         let device_identifier = persistence::device_identifier(&database)?;
         let kept_youtube_cookie_file = persistence::youtube_music_cookie_file(&database)?;
+        let kept_youtube_last_sync = persistence::youtube_music_last_sync(&database)?;
+        let youtube_song_count = all_tracks
+            .iter()
+            .filter(|track| track.source == library::TrackSource::YouTubeMusic)
+            .count();
 
         let bridge = Arc::new(EngineBridge::new(|event| {
             post(move |application| application.on_engine_event(event));
@@ -279,7 +285,9 @@ impl Application {
             jellyfin_library_ids: RefCell::new(Vec::new()),
             server_worker: Worker::new("janis media server")?,
             device_identifier,
-            youtube_music: youtube_music_screen::YouTubeMusicController::new()?,
+            youtube_music: youtube_music_screen::YouTubeMusicController::new(
+                kept_youtube_cookie_file.clone(),
+            )?,
             radio_screen: RefCell::new(radio_screen::RadioScreen::default()),
             radio_countries: Rc::new(VecModel::default()),
             radio_genres: Rc::new(VecModel::default()),
@@ -304,7 +312,7 @@ impl Application {
         });
         application.engine.set_source_resolver(Arc::new(
             youtube_music_screen::PlaybackResolver {
-                session: Arc::clone(&application.youtube_music.session),
+                account_cookie_file: Arc::clone(&application.youtube_music.account_cookie_file),
                 generation: Arc::clone(&application.youtube_music.generation),
             },
         ))?;
@@ -317,9 +325,12 @@ impl Application {
         // the window opens on the songs already in the library.
         let effects = application.media_server.borrow_mut().restore(kept_server);
         application.run(effects);
-        if let Some(path) = kept_youtube_cookie_file {
-            application.connect_youtube_cookie_file(path);
-        }
+        let effects = application.youtube_music.integration.borrow_mut().restore(
+            kept_youtube_cookie_file,
+            youtube_song_count,
+            kept_youtube_last_sync,
+        );
+        application.run(effects);
         // The engine answers with its current state, as events.
         application.engine.describe();
         application.refresh_player();
@@ -634,17 +645,13 @@ impl Application {
                     favourite,
                     sequence,
                 } => self.push_server_favourite(server, track_id, address, favourite, sequence),
-                Effect::ConnectYouTubeMusic { cookie_file, epoch } => {
-                    self.connect_youtube_account(cookie_file, epoch);
+                Effect::SyncYouTubeMusicLibrary { cookie_file, epoch } => {
+                    self.sync_youtube_library(cookie_file, epoch);
                 }
-                Effect::DisconnectYouTubeMusic => self.disconnect_youtube_account(),
+                Effect::RemoveYouTubeMusicLibrary => self.remove_youtube_library(),
                 Effect::ReadYouTubeMusic { request, epoch } => {
                     self.read_youtube_music(request, epoch)
                 }
-                Effect::PersistYouTubeMusicCookieFile(path) => self.saved(
-                    "youtube-music",
-                    persistence::set_youtube_music_cookie_file(&self.database, path.as_deref()),
-                ),
                 Effect::LoadCover(track_id) => self.load_current_cover(track_id),
                 Effect::LoadOverview(track_id) => self.load_overview(track_id),
                 Effect::ShowStreamCover(url) => self.show_stream_cover(url),

@@ -13,11 +13,7 @@ use crate::radio::Station;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum YouTubeMusicRequest {
     Search(String),
-    SavedSongs,
-    SavedPlaylists,
-    Playlist(String),
     MoreSongs,
-    MorePlaylists,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,16 +119,18 @@ pub enum Effect {
     },
 
     // ── YouTube Music ────────────────────────────────────────────────────────
-    ConnectYouTubeMusic {
+    /// Read the complete saved library before importing it, then report back
+    /// through `YouTubeMusicIntegration::sync_finished` with this `epoch`.
+    SyncYouTubeMusicLibrary {
         cookie_file: std::path::PathBuf,
         epoch: u64,
     },
-    DisconnectYouTubeMusic,
+    /// Forget this integration's tracks and persisted cookie-file path.
+    RemoveYouTubeMusicLibrary,
     ReadYouTubeMusic {
         request: YouTubeMusicRequest,
         epoch: u64,
     },
-    PersistYouTubeMusicCookieFile(Option<std::path::PathBuf>),
 
     // ── Presentation ─────────────────────────────────────────────────────────
     /// Show this track's cover art as the current art; `None` clears it.

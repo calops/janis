@@ -221,9 +221,14 @@ impl Application {
     /// Where the engine finds a track's audio: its file, or the original file
     /// on its server.
     pub(super) fn track_location(&self, track: &Track) -> Location {
-        if crate::youtube_music_state::video_identifier(track).is_some() {
+        if let Some(identifier) = crate::youtube_music_state::video_identifier(track) {
+            let namespace = if track.id > 0 {
+                "youtube-music-account"
+            } else {
+                "youtube-music"
+            };
             return Location::Deferred(crate::audio::DeferredSource {
-                id: track.path.clone(),
+                id: format!("{namespace}://{identifier}"),
             });
         }
         jellyfin::track_location(
@@ -239,8 +244,13 @@ impl Application {
     /// song on a server Janis is not signed in to has nowhere to be read from.
     pub(super) fn overview_locations(&self, track: &Track) -> Vec<Location> {
         if let Some(identifier) = crate::youtube_music_state::video_identifier(track) {
+            let namespace = if track.id > 0 {
+                "youtube-music-account-overview"
+            } else {
+                "youtube-music-overview"
+            };
             return vec![Location::Deferred(crate::audio::DeferredSource {
-                id: format!("youtube-music-overview://{identifier}"),
+                id: format!("{namespace}://{identifier}"),
             })];
         }
         jellyfin::overview_locations(

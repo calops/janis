@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_tracks_added ON tracks(added_at DESC);
 /// `SCHEMA` above is frozen at version 1 — it only ever creates a fresh file.
 /// Every change since is a migration, so a new database and an existing one
 /// converge on the same shape.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 // The migrations reach the version a fresh database is stamped with.
 const _: () = assert!(MIGRATIONS.len() as i64 + 1 == SCHEMA_VERSION);
@@ -161,6 +161,13 @@ const MIGRATIONS: &[&str] = &[
     // → 9: only the path of a user-owned cookie file is remembered. Google
     //      session cookies themselves never enter the database.
     "ALTER TABLE user_preferences ADD COLUMN youtube_music_cookie_file TEXT;",
+    // → 10: provider ownership separates remote songs from local-file work.
+    //       Existing Jellyfin rows keep their identity and associated state.
+    "ALTER TABLE tracks ADD COLUMN source TEXT NOT NULL DEFAULT 'file';
+     UPDATE tracks SET source = 'jellyfin' WHERE server_id IS NOT NULL;
+     ALTER TABLE tracks ADD COLUMN artwork_address TEXT;
+     CREATE INDEX IF NOT EXISTS idx_tracks_source ON tracks(source);
+     ALTER TABLE user_preferences ADD COLUMN youtube_music_last_sync_at INTEGER;",
 ];
 
 /// Opens (creating if needed) `janis.db` under the app-data directory and
@@ -322,18 +329,16 @@ pub fn youtube_music_cookie_file(database: &DbState) -> Result<Option<PathBuf>, 
         .map_err(|error| format!("read YouTube Music connection: {error}"))
 }
 
-pub fn set_youtube_music_cookie_file(
-    database: &DbState,
-    path: Option<&std::path::Path>,
-) -> Result<(), String> {
-    let path = path
-        .map(|path| path.to_str().ok_or("cookie file path is not Unicode"))
-        .transpose()?;
-    database.lock().execute(
-        "UPDATE user_preferences SET youtube_music_cookie_file = ?1, updated_at = unixepoch() WHERE id = 1",
-        [path],
-    ).map_err(|error| format!("save YouTube Music connection: {error}"))?;
-    Ok(())
+/// The last complete YouTube Music library import, in Unix seconds.
+pub fn youtube_music_last_sync(database: &DbState) -> Result<Option<i64>, String> {
+    database
+        .lock()
+        .query_row(
+            "SELECT youtube_music_last_sync_at FROM user_preferences WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("read YouTube Music sync time: {error}"))
 }
 
 pub fn set_volume(db: &DbState, volume: f64) -> Result<(), String> {
@@ -897,6 +902,63 @@ mod tests {
     }
 
     #[test]
+    fn provider_migration_tags_existing_server_rows_without_replacing_their_state() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        database_at_version(directory.path(), 9);
+        {
+            let connection =
+                Connection::open(directory.path().join(DATABASE_FILE)).expect("open old database");
+            connection
+                .execute_batch(
+                    "INSERT INTO media_servers
+                         (id, address, server_identifier, user_identifier, user_name, access_token)
+                     VALUES (7, 'http://server', 'server', 'user', 'Listener', 'token');
+                     INSERT INTO tracks
+                         (id, server_id, path, title, format, artwork_item, added_at, loudness_lufs)
+                     VALUES (42, 7, 'jellyfin://server/song', 'Server Song', 'FLAC', 'picture', 123, -14);
+                     INSERT INTO favourite_tracks (track_id, added_at) VALUES (42, 456);
+                     INSERT INTO server_libraries
+                         (id, server_id, library_identifier, name, shown)
+                     VALUES (3, 7, 'music', 'Music', 0);
+                     INSERT INTO track_libraries (track_id, library_id) VALUES (42, 3);",
+                )
+                .expect("seed old server state");
+        }
+
+        let database = init(directory.path().to_path_buf()).expect("migrate");
+        let tracks = crate::library::list_tracks(&database).expect("mapped tracks");
+        let file = tracks
+            .iter()
+            .find(|track| track.path == "/a.flac")
+            .expect("file");
+        assert_eq!(file.source, crate::library::TrackSource::File);
+        assert_eq!(file.artwork_address, None);
+        let server = tracks
+            .iter()
+            .find(|track| track.id == 42)
+            .expect("server song");
+        assert_eq!(server.source, crate::library::TrackSource::Jellyfin);
+        assert_eq!(server.server_id, Some(7));
+        assert_eq!(server.artwork_item.as_deref(), Some("picture"));
+        assert_eq!(server.artwork_address, None);
+        assert_eq!(server.server_libraries, [3]);
+        assert_eq!(server.added_at, 123);
+        assert_eq!(favourite_track_ids(&database), Ok(vec![42]));
+        assert!(!server_libraries(&database).expect("libraries")[0].shown);
+        assert_eq!(youtube_music_last_sync(&database), Ok(None));
+        let connection = database.lock();
+        let state: (f64, i64) = connection
+            .query_row(
+                "SELECT loudness_lufs, favourite_tracks.added_at
+                 FROM tracks JOIN favourite_tracks ON track_id = tracks.id WHERE tracks.id = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("retained state");
+        assert_eq!(state, (-14.0, 456));
+    }
+
+    #[test]
     fn a_database_from_every_earlier_version_upgrades_and_keeps_what_it_held() {
         // Version 0 is a file from before migrations; 1 to 5 are each release
         // since. Every one must land on the current shape with nothing lost.
@@ -917,6 +979,7 @@ mod tests {
             assert_eq!(server_libraries(&database), Ok(Vec::new()));
             assert_eq!(favourite_track_ids(&database), Ok(Vec::new()));
             assert_eq!(youtube_music_cookie_file(&database), Ok(None));
+            assert_eq!(youtube_music_last_sync(&database), Ok(None));
             let connection = database.lock();
             let (title, server_id): (String, Option<i64>) = connection
                 .query_row(
@@ -953,7 +1016,7 @@ mod tests {
         database
             .lock()
             .execute(
-                "INSERT INTO tracks (server_id, path, title, format) VALUES (?1, ?2, 'T', 'FLAC')",
+                "INSERT INTO tracks (server_id, source, path, title, format) VALUES (?1, 'jellyfin', ?2, 'T', 'FLAC')",
                 rusqlite::params![server_id, format!("jellyfin://server/{item}")],
             )
             .expect("insert a server track");

@@ -1,5 +1,4 @@
-// YouTube Music source data, filled by the controller. Account access and
-// requests live outside the interface; these callbacks only report actions.
+// Anonymous YouTube Music catalog data, filled by the controller.
 
 export struct YouTubeMusicSong {
     track-id: int,
@@ -11,32 +10,15 @@ export struct YouTubeMusicSong {
     gradient-index: int,
 }
 
-export struct YouTubeMusicPlaylist {
-    identifier: string,
-    title: string,
-    description: string,
-    track-id: int,
-    gradient-index: int,
-}
-
 export global YouTubeMusic {
     in-out property <string> query;
-    in property <bool> connected;
-    in property <bool> busy;
     in property <bool> loading;
     in property <bool> status-failed;
     in property <bool> has-more;
     in property <string> status;
-    in property <string> view: "search";
-    in property <string> playlist-title;
     in property <[YouTubeMusicSong]> songs;
-    in property <[YouTubeMusicPlaylist]> playlists;
 
     callback search-submitted();
-    callback view-selected(view: string);
     callback song-clicked(index: int);
-    callback playlist-clicked(index: int);
     callback more-clicked();
-    callback connect-clicked();
-    callback disconnect-clicked();
 }

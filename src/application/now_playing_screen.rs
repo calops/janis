@@ -171,11 +171,7 @@ impl Application {
         let translations = self.translations.borrow();
         let view = self.window.global::<user_interface::Player>();
 
-        view.set_favourite_available(
-            player
-                .current()
-                .is_none_or(|track| crate::youtube_music_state::video_identifier(track).is_none()),
-        );
+        view.set_favourite_available(player.current().is_none_or(|track| track.id > 0));
         view.set_active(player.mode() != Mode::Idle);
         view.set_playing(player.playing());
         view.set_shuffle(player.shuffle());
