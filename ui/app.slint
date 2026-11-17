@@ -23,8 +23,10 @@ import { Settings } from "features/settings/settings.slint";
 import { Radio } from "features/radio/radio.slint";
 import { Library } from "features/library/library.slint";
 import { Jellyfin } from "features/jellyfin/jellyfin.slint";
+import { YouTubeMusic } from "features/youtube_music/youtube_music.slint";
+import { YouTubeMusicScreen } from "screens/youtube_music_screen.slint";
 
-export { Strings, Shell, Player, Covers, Equalizer, Library, Radio, Settings, Jellyfin, Tokens }
+export { Strings, Shell, Player, Covers, Equalizer, Library, Radio, Settings, Jellyfin, YouTubeMusic, Tokens }
 
 export component AppWindow inherits Window {
     title: "Janis";
@@ -59,7 +61,8 @@ export component AppWindow inherits Window {
                         label: Strings.nav-section-sources,
                         items: [
                             { id: "radio", label: Strings.nav-radio, icon: Icons.radio },
-                            { id: "local", label: Strings.nav-local, icon: Icons.local-files }
+                            { id: "local", label: Strings.nav-local, icon: Icons.local-files },
+                            { id: "youtube-music", label: Strings.youtube-music-title, icon: Icons.play }
                         ]
                     }
                 ];
@@ -76,6 +79,7 @@ export component AppWindow inherits Window {
                 if Shell.screen == "library": LibraryScreen { }
                 if Shell.screen == "local": LocalFilesScreen { }
                 if Shell.screen == "radio": RadioScreen { }
+                if Shell.screen == "youtube-music": YouTubeMusicScreen { }
                 if Shell.screen == "discover": DiscoverScreen { }
                 if Shell.screen == "settings": SettingsScreen { }
             }

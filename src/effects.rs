@@ -9,6 +9,16 @@
 use crate::library::Track;
 use crate::persistence::{MediaServer, PlaybackOption};
 use crate::radio::Station;
+/// A YouTube Music read, carried out on its worker rather than in the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum YouTubeMusicRequest {
+    Search(String),
+    SavedSongs,
+    SavedPlaylists,
+    Playlist(String),
+    MoreSongs,
+    MorePlaylists,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
@@ -30,6 +40,11 @@ pub enum Effect {
     JumpTo(usize),
     /// Seek to a position in seconds.
     Seek(f64),
+    /// Reopen the current source at this position and desired transport state.
+    RefreshCurrent {
+        position_seconds: f64,
+        playing: bool,
+    },
     SetShuffle(bool),
     SetRepeat(bool),
 
@@ -106,6 +121,18 @@ pub enum Effect {
         favourite: bool,
         sequence: u64,
     },
+
+    // ── YouTube Music ────────────────────────────────────────────────────────
+    ConnectYouTubeMusic {
+        cookie_file: std::path::PathBuf,
+        epoch: u64,
+    },
+    DisconnectYouTubeMusic,
+    ReadYouTubeMusic {
+        request: YouTubeMusicRequest,
+        epoch: u64,
+    },
+    PersistYouTubeMusicCookieFile(Option<std::path::PathBuf>),
 
     // ── Presentation ─────────────────────────────────────────────────────────
     /// Show this track's cover art as the current art; `None` clears it.

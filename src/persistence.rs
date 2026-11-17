@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_tracks_added ON tracks(added_at DESC);
 /// `SCHEMA` above is frozen at version 1 — it only ever creates a fresh file.
 /// Every change since is a migration, so a new database and an existing one
 /// converge on the same shape.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 // The migrations reach the version a fresh database is stamped with.
 const _: () = assert!(MIGRATIONS.len() as i64 + 1 == SCHEMA_VERSION);
@@ -158,6 +158,9 @@ const MIGRATIONS: &[&str] = &[
          track_id INTEGER NOT NULL UNIQUE REFERENCES tracks(id) ON DELETE CASCADE,
          added_at INTEGER NOT NULL DEFAULT (unixepoch())
      );",
+    // → 9: only the path of a user-owned cookie file is remembered. Google
+    //      session cookies themselves never enter the database.
+    "ALTER TABLE user_preferences ADD COLUMN youtube_music_cookie_file TEXT;",
 ];
 
 /// Opens (creating if needed) `janis.db` under the app-data directory and
@@ -304,6 +307,33 @@ pub fn get_preferences(db: &DbState) -> Result<Preferences, String> {
         },
     )
     .map_err(|e| format!("read preferences: {}", e))
+}
+
+/// The user-owned cookie file to read on a worker when restoring the source.
+pub fn youtube_music_cookie_file(database: &DbState) -> Result<Option<PathBuf>, String> {
+    database
+        .lock()
+        .query_row(
+            "SELECT youtube_music_cookie_file FROM user_preferences WHERE id = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map(|path| path.map(PathBuf::from))
+        .map_err(|error| format!("read YouTube Music connection: {error}"))
+}
+
+pub fn set_youtube_music_cookie_file(
+    database: &DbState,
+    path: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let path = path
+        .map(|path| path.to_str().ok_or("cookie file path is not Unicode"))
+        .transpose()?;
+    database.lock().execute(
+        "UPDATE user_preferences SET youtube_music_cookie_file = ?1, updated_at = unixepoch() WHERE id = 1",
+        [path],
+    ).map_err(|error| format!("save YouTube Music connection: {error}"))?;
+    Ok(())
 }
 
 pub fn set_volume(db: &DbState, volume: f64) -> Result<(), String> {
@@ -886,6 +916,7 @@ mod tests {
             assert_eq!(media_server(&database), Ok(None));
             assert_eq!(server_libraries(&database), Ok(Vec::new()));
             assert_eq!(favourite_track_ids(&database), Ok(Vec::new()));
+            assert_eq!(youtube_music_cookie_file(&database), Ok(None));
             let connection = database.lock();
             let (title, server_id): (String, Option<i64>) = connection
                 .query_row(

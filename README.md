@@ -10,6 +10,7 @@ A native application written in **Rust**, with a **[Slint](https://slint.dev)** 
 - **Now Playing** — hero album art (embedded cover art, or a generated prism gradient), track/artist/composer/album metadata, live waveform with click-to-seek, transport with shuffle/repeat, volume, a queue card (up next / playlist / current album), and an artist spotlight drawn from your library.
 - **Library** — scan folders or import files; albums, artists and songs views grouped from real tags (`lofty`); favourite songs you star from any list or from Now Playing, gathered in a Favourites tab; search from the titlebar.
 - **Jellyfin** — sign in to your Jellyfin server in Settings and its songs join the library, playing the original files from the server through the same engine (EQ, gapless, normalization with the server's own gains, waveform), with the server's cover art; every library of the server is synced, and each can be switched off to keep its songs out of Janis; favourites stay in step with the server both ways.
+- **YouTube Music** — Music search and account browsing through upstream RustyPipe; audio URLs resolved by an optional, separately installed `yt-dlp` on `PATH`. Janis's native engine streams and plays the audio, including EQ, seeking, the track overview and queue transitions. Janis does not bundle, install or update yt-dlp.
 - **Discover** — shelves derived from your own library (recently added albums, artists, rediscoveries).
 - **Web Radio** — curated station list (SomaFM, FIP, Radio Paradise, KEXP, …) with country and genre filters, and favourites you star.
 - **Local Files** — drop zone (real OS drag-and-drop), scanned-library table with format badges, watched-folder management, rescan.
@@ -51,6 +52,8 @@ direnv allow          # once — enters the dev shell automatically
 cargo run             # the app (`just run`, or plain `run`, do the same)
 ```
 
+For YouTube Music development checks, `JANIS_YOUTUBE_SEARCH=<query>` submits a catalog search and `JANIS_YOUTUBE_AUTOPLAY=1` starts its first result silently; combine these with `JANIS_SCREEN=youtube-music` and `JANIS_SNAPSHOT=<file.png>`. Playback requires a separately installed `yt-dlp` on `PATH`.
+
 Quality gates run locally (the only workflow in CI is the release build):
 
 ```bash
@@ -66,7 +69,7 @@ just test-rust        # cargo test
 
 ## Architecture in one paragraph
 
-One process, all Rust. The scanner walks watched folders, reads tags with `lofty`, and upserts into a bundled-SQLite `janis.db`. Sound is the `audio-stack-rs` crate's: an engine thread decodes with symphonia, resamples only when the file and the device disagree, and feeds a lock-free ring that a cpal callback drains through ten peaking filters into the output device. The queue and the transport live there too, so playback is independent of the UI. Web radio takes the same path — buffered over HTTP into the same decoder — so stations get the equalizer and a real visualiser, and their ICY track titles show up in Now Playing. A Jellyfin server's songs are synced into the same `tracks` table and play their original files, downloaded as they play and seeked with range requests, so they behave exactly like local files. What the screens show lives in plain state modules that decide and return effects; one controller on the interface thread carries the effects out and pushes what changed to the Slint globals the screens read. The interface (`ui/`) is a three-layer atomic design system (design system → features → screens, one-way dependencies) drawing every color, size and duration from one token file. Details in [`CLAUDE.md`](CLAUDE.md) and [`docs/specs.md`](docs/specs.md); the reasons behind them in [`decisions-log.md`](decisions-log.md).
+The application and audio path are Rust; YouTube URL extraction uses an optional external helper. The scanner walks watched folders, reads tags with `lofty`, and upserts into a bundled-SQLite `janis.db`. Sound is the `audio-stack-rs` crate's: an engine thread decodes with symphonia, resamples only when the file and the device disagree, and feeds a lock-free ring that a cpal callback drains through ten peaking filters into the output device. The queue and the transport live there too, so playback is independent of the UI. Web radio takes the same path — buffered over HTTP into the same decoder — so stations get the equalizer and a real visualiser, and their ICY track titles show up in Now Playing. A Jellyfin server's songs are synced into the same `tracks` table and play their original files, downloaded as they play and seeked with range requests, so they behave exactly like local files. What the screens show lives in plain state modules that decide and return effects; one controller on the interface thread carries the effects out and pushes what changed to the Slint globals the screens read. The interface (`ui/`) is a three-layer atomic design system (design system → features → screens, one-way dependencies) drawing every color, size and duration from one token file. Details in [`CLAUDE.md`](CLAUDE.md) and [`docs/specs.md`](docs/specs.md); the reasons behind them in [`decisions-log.md`](decisions-log.md).
 
 ## License
 

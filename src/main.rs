@@ -37,6 +37,9 @@ mod string_names;
 mod text;
 mod translations;
 mod visualizer;
+mod youtube_extraction;
+mod youtube_music;
+mod youtube_music_state;
 
 /// The compiled user interface, and the function that fills its `Strings`
 /// global from a translation lookup.
@@ -164,6 +167,11 @@ mod development {
         if let Ok(search) = std::env::var("JANIS_SEARCH") {
             shell.set_search(search.as_str().into());
             shell.invoke_search_edited(search.into());
+        }
+        if let Ok(query) = std::env::var("JANIS_YOUTUBE_SEARCH") {
+            let source = window.global::<crate::user_interface::YouTubeMusic>();
+            source.set_query(query.into());
+            source.invoke_search_submitted();
         }
     }
 
